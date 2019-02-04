@@ -32,19 +32,36 @@ module framing_top
   input wire          phy_pme_n,
    
   input wire          phy_mdio_i,
-  output reg          phy_mdio_o,
-  output reg          phy_mdio_oen,
+  output wire         phy_mdio_o,
+  output wire         phy_mdio_oen,
   output wire         phy_mdc,
 
   output reg          eth_irq
    );
 
-// obsolete signals to be removedphy_
-//    
-
+logic         phy_mdio_oe;
+logic         NoPre;              // No Preamble (no 32-bit preamble)
+logic   [4:0] Fiad;               // PHY Address
+logic  [15:0] CtrlData;           // Control Data (to be written to the PHY reg.)
+logic   [7:0] Divider;            // Divider for the host clock
+logic   [4:0] Rgad;               // Register Address (within the PHY)
+logic         WCtrlData;          // Write Control Data operation
+logic         RStat;              // Read Status operation
+logic         ScanStat;           // Scan Status operation
    
-logic [14:0] core_lsu_addr_dly;   
+wire        Busy;               // Busy Signal
+wire        LinkFail;           // Link Integrity Signal
+wire        Nvalid;             // Invalid Status (qualifier for the valid scan result)
 
+wire [15:0] Prsd;               // Read Status Data (data read from the PHY)
+
+wire        WCtrlDataStart;     // This signals resets the WCTRLDATA bit in the MIIM Command register
+wire        RStatStart;         // This signal resets the RSTAT BIT in the MIIM Command register
+wire        UpdateMIIRX_DATAReg;// Updates MII RX_DATA register with read data
+      
+assign phy_mdio_oen = !phy_mdio_oe;
+
+logic [14:0] core_lsu_addr_dly;   
 logic tx_enable_i, mac_gmii_tx_en;
 logic [47:0] mac_address, rx_dest_mac;
 logic [10:0] tx_frame_addr, rx_length_axis[0:7], tx_packet_length;
@@ -57,8 +74,7 @@ logic [2:0] last;
 reg        byte_sync, sync, irq_en, tx_busy, rx_axis_tvalid_old;
 
    wire [7:0] m_enb = (we_d ? core_lsu_be : 8'hFF);
-   logic phy_mdclk, cooked, tx_enable_old, loopback, promiscuous;
-   logic [3:0] spare;   
+   logic tx_enable_old, promiscuous;
    logic [10:0] rx_addr_axis;
    
        /*
@@ -114,7 +130,6 @@ reg        byte_sync, sync, irq_en, tx_busy, rx_axis_tvalid_old;
    wire  [1:0] rx_wr = rx_axis_tvalid << rx_addr_axis[2];
    logic [15:0] douta;
    assign tx_axis_tdata = douta >> {tx_frame_addr[2],3'b000};
-   assign phy_mdc = phy_mdclk;
    
    dualmem_widen8 RAMB16_inst_rx (
                                     .clka(rx_clk),                // Port A Clock
@@ -155,13 +170,7 @@ always @(posedge msoc_clk)
     mac_address <= 48'H230100890702;
     tx_packet_length <= 0;
     tx_enable_dly <= 0;
-    cooked <= 1'b0;
-    loopback <= 1'b0;
-    spare <= 4'b0;
     promiscuous <= 1'b0;
-    phy_mdio_oen <= 1'b0;
-    phy_mdio_o <= 1'b0;
-    phy_mdclk <= 1'b0;
     sync <= 1'b0;
     firstbuf <= 4'b0;
     lastbuf <= 4'b0;
@@ -178,13 +187,16 @@ always @(posedge msoc_clk)
     ce_d_dly <= ce_d;
     avail = nextbuf != firstbuf;
     eth_irq <= avail & irq_en; // make eth_irq go away immediately if irq_en is low
+    if (WCtrlDataStart) WCtrlData <= 1'b0;
+    if (RStatStart) RStat <= 1'b0;
+    if (UpdateMIIRX_DATAReg) CtrlData <= Prsd;
     if (framing_sel&we_d&(&core_lsu_be[3:0])&(core_lsu_addr[14:11]==4'b0001))
       case(core_lsu_addr[6:3])
         0: mac_address[31:0] <= core_lsu_wdata;
-        1: {irq_en,promiscuous,spare,loopback,cooked,mac_address[47:32]} <= core_lsu_wdata;
+        1: {Divider,irq_en,promiscuous,NoPre,Fiad,mac_address[47:32]} <= core_lsu_wdata;
         2: begin tx_enable_dly <= 10; tx_packet_length <= core_lsu_wdata; end /* tx payload size */
         3: begin tx_enable_dly <= 0; tx_packet_length <= 0; end
-        4: begin {phy_mdio_oen,phy_mdio_o,phy_mdclk} <= core_lsu_wdata; end
+        4: begin {ScanStat,RStat,WCtrlData,Rgad,CtrlData} <= core_lsu_wdata; end
         5: begin lastbuf <= core_lsu_wdata[3:0]; end
         6: begin firstbuf <= core_lsu_wdata[3:0]; end
         default:;
@@ -230,10 +242,10 @@ always @(posedge clk_int)
    
    always @* casez({ce_d_dly,core_lsu_addr_dly[14:3]})
     13'b10001????0000 : framing_rdata = mac_address[31:0];
-    13'b10001????0001 : framing_rdata = {irq_en, promiscuous, spare, loopback, cooked, mac_address[47:32]};
+    13'b10001????0001 : framing_rdata = {Divider,irq_en,promiscuous,NoPre,Fiad,mac_address[47:32]};
     13'b1000?????0010 : framing_rdata = {tx_busy, 4'b0, tx_frame_addr, 5'b0, tx_packet_length};
     13'b10001????0011 : framing_rdata = tx_fcs_reg_rev;
-    13'b10001????0100 : framing_rdata = {phy_mdio_i,phy_mdio_oen,phy_mdio_o,phy_mdclk};
+    13'b10001????0100 : framing_rdata = {Nvalid,LinkFail,Busy,ScanStat,RStat,WCtrlData,Rgad,CtrlData};
     13'b10001????0101 : framing_rdata = rx_fcs_reg_rev;
     13'b10001????0110 : framing_rdata = {eth_irq, avail, lastbuf, nextbuf, firstbuf};
     13'b10001????1??? : framing_rdata = rx_length_axis[core_lsu_addr_dly[5:3]];
@@ -354,6 +366,7 @@ rgmii_soc rgmii_soc1
 );
 
 `define XILINX_ILA_1
+`define XILINX_ILA_3
 
 `ifdef XILINX_ILA_1   
 xlnx_ila_1 eth_ila_clk_rx (
@@ -367,7 +380,8 @@ xlnx_ila_1 eth_ila_clk_rx (
         .probe6(rx_addr_axis),
         .probe7(rx_dest_mac),
         .probe8(rx_length_axis[nextbuf[2:0]]),
-	.probe9(rx_axis_tvalid_old)
+	.probe9(rx_axis_tvalid_old),
+	.probe10(rx_clk) // rx_clk ( <= clk_int )
 );
 `endif
 
@@ -392,9 +406,49 @@ xlnx_ila_3 eth_ila_clk_msoc (
 	.probe1(avail),
         .probe2(nextbuf),
         .probe3(tx_enable_dly),
-        .probe4(tx_busy)
+        .probe4(tx_busy),
+        .probe5(Prsd),
+        .probe6(Busy),
+        .probe7(LinkFail),
+        .probe8(Nvalid),
+        .probe9(WCtrlDataStart),
+        .probe10(RStatStart),
+        .probe11(UpdateMIIRX_DATAReg),
+        .probe12(WCtrlData),
+        .probe13(RStat),
+        .probe14(ScanStat),
+        .probe15(phy_mdio_i),
+        .probe16(phy_mdio_o),
+        .probe17(phy_mdio_oe),
+        .probe18(phy_mdc)
 );
 `endif
+
+// Connecting Miim module
+eth_miim miim1
+(
+  .Clk(msoc_clk),
+  .Reset(rst_int),
+  .Mdi(phy_mdio_i),
+  .Mdo(phy_mdio_o),
+  .MdoEn(phy_mdio_oe),
+  .Mdc(phy_mdc),
+  .Busy,
+  .Divider,
+  .NoPre,
+  .CtrlData,
+  .Rgad,
+  .Fiad,
+  .WCtrlData,
+  .RStat,
+  .ScanStat,
+  .Prsd,
+  .LinkFail,
+  .Nvalid,
+  .WCtrlDataStart,
+  .RStatStart,
+  .UpdateMIIRX_DATAReg
+);
    
 endmodule // framing_top
 `default_nettype wire
